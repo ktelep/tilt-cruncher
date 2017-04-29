@@ -1,25 +1,37 @@
-from flask import Flask
+from flask import Flask, jsonify
 from flask_sslify import SSLify
 from flask_apscheduler import APScheduler
+from collections import defaultdict
 import os
+import sys
 import time
 import json
 import redis
+import timeit
 import logging
+import datetime
 
 
 logging.basicConfig(level=logging.DEBUG)
 
 app = Flask(__name__, static_url_path='/static')
 
+job_schedule = 10
+
 class Config(object):
     JOBS = [
         {
-            'id': 'average',
-            'func': 'tilt_cruncher:average',
-            'args': (1, 2),
+            'id': 'per_devid_stats',
+            'func': 'tilt_cruncher:per_devid_stats',
             'trigger': 'interval',
-            'seconds': 10 
+            'seconds': job_schedule
+            },
+        {   
+            'id': 'dev_id_counts',
+            'func': 'tilt_cruncher:dev_id_counts',
+            'args' : (6,),
+            'trigger' : 'interval',
+            'seconds' : job_schedule
             }
     ]
     SCHEDULER_API_ENABLED = True
@@ -126,13 +138,9 @@ try:
     # Test our connection
     response = r.client_list()
 
-    r.set("server:" + inst_index, 0)
-    r.expire("server:" + inst_index, 3)
-
 except redis.ConnectionError:
     print "Unable to connect to a Redis server, check environment"
     sys.exit(1)
-
 
 def timestamp():
     now = time.time()
@@ -140,9 +148,145 @@ def timestamp():
     milliseconds = '%03d' % int((now - int(now)) * 1000)
     return int(time.strftime('%Y%m%d%H%M%S', localtime) + milliseconds)
 
-def job1(a, b):
-    print timestamp()
-    r.set("Test",timestamp())
+def per_devid_stats():
+    """ Calculate Min, Max, and Average values of the current active devids """
+
+    start_time = timeit.default_timer()
+    logging.info("Beginning average calculation")
+
+    average_vals = ['TiltFB','TiltLR','Direction','ReqSize']
+    device_keys = [x.split(':')[-1] for x in r.keys('devid:*')]
+
+    to_insert = dict()
+
+    for key in device_keys:
+        for val in average_vals:
+            val_key = "devidhistory:%s:%s:Values" % (key, val)
+            avg_key = "devidhistory:%s:%s:Average" % (key, val)
+            min_key = "devidhistory:%s:%s:Min" % (key, val)
+            max_key = "devidhistory:%s:%s:Max" % (key, val)
+            hand = "devidhistory:%s:Hand" % (key)
+               
+            # Need to cast our vals from string to floats
+            values = [float(x) for x in r.zrange(val_key,0,-1)]
+            avg = sum(values)/float(len(values))
+
+            if "TiltLR" in val:  # Basic hand analysis.  
+                if avg < 0:  # Right Handheld
+                    to_insert[hand] = "Right"
+                else:
+                    to_insert[hand] = "Left"
+
+            to_insert[avg_key] = avg
+            to_insert[max_key] = max(values)
+            to_insert[min_key] = min(values)
+   
+    if to_insert.keys():
+        r.mset(to_insert)
+
+    elapsed = timeit.default_timer() - start_time
+    logging.info("Calculated %d keys in %s" % (len(device_keys), str(elapsed)))
+
+def dev_id_counts(hours):
+    """ Calculate the hourly number of tilt users """
+    
+    start_time = timeit.default_timer()
+    logging.info("Beginning dev_id_counts")
+ 
+    current_score = timestamp()
+    
+    top = datetime.datetime.now()
+    top_score = top.strftime("%Y%m%d%H0000000")
+
+    # Calc active this hour and set "current" key
+    count = r.zcount("devidlist", top_score, current_score)
+    r.set('devidcount:current', count) 
+    logging.info('%d between %s and %s' % (count, top_score, current_score))
+
+    # Calc previous hours
+    for i in range(0,hours):
+        # We want hourly chunks of data
+        bottom = top - datetime.timedelta(hours=1)
+
+        # Normalize the times to the top of the hours
+        top_score = top.strftime("%Y%m%d%H0000000")
+        bottom_score = bottom.strftime("%Y%m%d%H0000000")
+
+        # no need to RE-count already counted time periods
+        logging.info(r.exists("devidcount:%s" % (top_score)))
+        if not r.exists(top_score):
+
+            # Get Count between top and bottom
+            count = r.zcount("devidlist", bottom_score, top_score)
+            logging.info('%d between %s and %s' % (count, bottom_score, top_score))
+            r.set('devidcount:%s' % (top_score), count)
+
+        #Reset the top to the bottom
+        top = bottom
+        
+    elapsed = timeit.default_timer() - start_time
+    logging.info("Calculated Devid Counts in %s" % (str(elapsed)))
+
+@app.route('/')
+def index():
+    return "Tilt-Cruncher!"
+
+   
+@app.route('/active_averages')
+@app.route('/active_averages/<devid>')
+def active_averages(devid=None):
+    device_keys = []
+
+    if devid:
+       device_keys.append(devid)
+    else:
+       device_keys = [x.split(':')[-1] for x in r.keys('devid:*')]
+
+    average_vals = ['TiltFB','TiltLR','Direction','ReqSize']
+
+    return_val = defaultdict(dict)
+
+    for key in device_keys:
+        for val in average_vals:
+            avg_key = "devidhistory:%s:%s:Average" % (key, val)
+            average = r.get(avg_key)
+            return_val[key][val] = average
+
+    
+    return jsonify(data=return_val)
+
+@app.route('/active_latest')
+@app.route('/active_latest/<devid>')
+def active_latest(devid=None):
+    device_keys = []
+
+    if devid:
+       device_keys.append(devid)
+    else:
+       device_keys = [x.split(':')[-1] for x in r.keys('devid:*')]
+
+    vals = ['TiltFB','TiltLR','Direction','ReqSize']
+    static_vals = ['OS','altitude','latitude','longitude',
+                   'direction','industry']
+
+    return_val = defaultdict(dict)
+
+    for key in device_keys:
+        for val in vals:
+            val_key = "devidhistory:%s:%s:Values" % (key, val)
+            data = r.zrevrangebyscore(val_key,"+inf","-inf")
+            return_val[key][val] = data[0]
+
+        for val in static_vals:
+            val_key = "devidhistory:%s:%s:Values" % (key, val)
+            data = r.get(val_key)
+            return_val[key][val] = data
+            
+        hand_key = "devidHistory:%s:Hand" % (key,)
+        data = r.get(hand_key)
+        return_val[key]['Hand'] = data
+    
+    return jsonify(data=return_val)
 
 sslify = SSLify(app)
 
